@@ -1,0 +1,76 @@
+---
+  global:
+    device: &device cuda:0
+    resolution: &resolution
+      width: 1920
+      height: 1080
+    dump: &dump False
+
+  mct:
+    appearance_threshold: 0.35
+    distance_threshold: 1500
+    floor_height: ${FLOOR_HEIGHT}
+    floor_width: ${FLOOR_WIDTH}
+    top_down_file: ${TOP_DOWN_FILE}
+
+  cameras:  # Camera configuration
+    c200_1:
+      type: "rtsp"
+      address: "192.168.1.2:8554/c200_1"
+      dump: *dump
+      resolution: *resolution
+      matrix_path: "c200_1_mtx.npy"
+      distortion_coeff_path: "c200_1_dist.npy"
+      homography_matrix_path: "c200_1_H.npy"
+      visualize_color: [0, 0, 255]
+
+    zed2i_1:
+      type: "rtsp"
+      address: "192.168.1.2:8554/zed_1"
+      dump: *dump
+      resolution: *resolution
+      homography_matrix_path: "zed1_H.npy"
+      visualize_color: [255, 0, 0]
+
+  models:  # Model configuration
+    yolo:
+      checkpoint: "checkpoints/yolov8s-pose.pt"
+      device: *device
+      imgsz: 640
+      target_class: 0
+      half: True
+
+    bot_sort:
+      track_high_thresh: 0.5  # tracking confidence threshold
+      track_low_thresh: 0.1  # lowest detection threshold
+      new_track_thresh: 0.6  # new track threshold
+      track_buffer: 30
+      proximity_thresh: 0.5  # threshold for rejecting low overlap reid matches
+      appearance_thresh: 0.25  # threshold for rejecting low appearance similarity reid matches
+      match_thresh: 0.8  # matching threshold for tracking
+      with_reid: True
+      cmc_method: "orb"
+      device: *device
+      batch_size: 8
+      osnets:
+        - name: "osnet_ibn_x1_0"
+          checkpoint_path: "checkpoints/osnet_ibn_ms_m_c.pth.tar"
+        - name: "osnet_ain_x1_0"
+          checkpoint_path: "checkpoints/osnet_ain_ms_m_c.pth.tar"
+
+    # reid:
+    #   model_name: "semi"
+    #   ovms_address: "localhost:19000"
+    #   input_name: "input"
+    #   output_name: "output"
+    #   input_order: "n c t h w"
+    #   sequence_length: 8
+    #   frame_interval: 0.2
+    #   reid_interval_known: 60.
+    #   reid_interval_unknown: 10.
+    #   input_width: 128
+    #   input_height: 256
+
+    # annoy:
+    #   annoy_file: "results/index.ann"
+    #   identity_info: "results/idx_to_info.pkl"
