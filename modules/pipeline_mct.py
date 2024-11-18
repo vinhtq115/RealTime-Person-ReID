@@ -1,13 +1,14 @@
 # Pipeline for multi-camera tracking (MCT).
 from copy import deepcopy
 from itertools import combinations
+import logging
 import multiprocessing as mp
 from pathlib import Path
 import pickle
 import queue
 from threading import Thread
 import time
-from typing import List, Tuple
+from typing import List, Tuple, Set
 from itertools import combinations
 
 import cv2
@@ -287,17 +288,6 @@ def assign_global_ids(
                 sct = global_id_to_cam_sct[global_id_2].pop(cam)
                 cam_sct_to_global_id.pop((cam, sct), None)
 
-            # if global_id_to_cam_sct[global_id_1].get(cam2, None) is not None and \
-            #     (cam2, global_id_to_cam_sct[global_id_1][cam2]) in cam_scts_to_index:
-            #     # print(f"Global ID 1 ({global_id_1}) is in camera 2 ({cam2}).")
-            #     # results.append((f"{p1} ({cam1}_{sct1})", f"{p2} ({cam2}_{sct2})", f"{score}", "GID1 in cam2"))
-            #     continue
-            # if global_id_to_cam_sct[global_id_2].get(cam1, None) is not None and \
-            #     (cam1, global_id_to_cam_sct[global_id_2][cam1]) in cam_scts_to_index:
-            #     # print(f"Global ID 2 ({global_id_2}) is in camera 1 ({cam1}).")
-            #     # results.append((f"{p1} ({cam1}_{sct1})", f"{p2} ({cam2}_{sct2})", f"{score}", "GID2 in cam1"))
-            #     continue
-
             # Gather tracklets of each global id
             gid_1_cam_scts, gid_2_cam_scts = [], []
             for cam, sct in global_id_to_cam_sct[global_id_1].items():
@@ -441,6 +431,8 @@ class PipelineMCT(mp.Process):
                  mct_config: dict,
                  camera_configs: dict,
                  data_queues: List[mp.Queue],
+                 reid_queue: mp.Queue,
+                 reid_result_queue: mp.Queue,
                  raw_data_dir: Path,
                  start_event: mp.Event,
                  global_kill: mp.Event,
@@ -451,12 +443,17 @@ class PipelineMCT(mp.Process):
         self.camera_configs = camera_configs
         self.camera_names = natsorted(camera_configs.keys())
         self.data_queues = data_queues
+        self.reid_queue = reid_queue
+        self.reid_result_queue = reid_result_queue
         self.start_event = start_event
         self.raw_data_dir = raw_data_dir
         self.cam_latest_data = []
+        self.reid_result = {}  # {global_id: name}
         self.appearance_threshold = mct_config["appearance_threshold"]
         self.distance_threshold = mct_config["distance_threshold"]
         self.screenshot_dir = screenshot_dir
+
+        self.logger = logging.getLogger("MCT")
 
         # Overlay
         self.room_height = mct_config["floor_height"]
@@ -488,13 +485,16 @@ class PipelineMCT(mp.Process):
         if not cam_data_dir.exists():
             cam_data_dir.mkdir(parents=True)
 
+        try_count = 0
+
         while True:
             try:
                 # Get data from each process
-                data = data_queue.get(block=True, timeout=0.02)
+                data = data_queue.get(block=True, timeout=0.01)
                 if isinstance(data, DoneSignal):
                     # Camera has finished processing. No more data will be sent to it
                     self.cam_latest_data[cam_idx]["terminated"] = True
+                    self.logger.info(f"[MCT] Detected done signal from {cam_name}. Terminating queue query thread.")
                     break
 
                 frame, frame_idx, online_targets, removed_targets = data
@@ -507,32 +507,27 @@ class PipelineMCT(mp.Process):
                 self.cam_latest_data[cam_idx]["online_targets"] = online_targets
                 self.cam_latest_data[cam_idx]["removed_targets"] = removed_targets
 
-                # # For dumping data to disk
-                # tracking_data = {}
-                # for target in online_targets:
-                #     x1, y1, x2, y2 = [int(i) for i in target.tlbr]
-                #     x1 = max(0, x1)
-                #     y1 = max(0, y1)
-                #     x2 = min(frame.shape[1], x2)
-                #     y2 = min(frame.shape[0], y2)
-                #     tracking_data[target.track_id] = {
-                #         "bbox": (x1, y1, x2, y2),
-                #         "score": target.score,
-                #         "pose": target.pose,
-                #         "smooth_feat": target.smooth_feat,
-                #         "curr_feat": target.curr_feat,
-                #         "world_coord": target.world_coord
-                #     }
-
-                # # Save data
-                # data_path = cam_data_dir / f"{frame_idx:06d}.pkl"
-                # with open(data_path.as_posix(), "wb") as file:
-                #     pickle.dump(tracking_data, file, protocol=5)
-
             except queue.Empty:
+                try_count += 1
+                if try_count == 3 and self.global_kill.is_set():
+                    self.logger.info(f"[MCT] Detected global kill signal after 3 tries. Terminating queue query thread for {cam_name}.")
+                    break
                 pass
 
-        print(f"[MCT] Detected done signal from camera {cam_name}. Terminating.")
+    def reid_result_query(self):
+        """Thread for getting Re-ID result."""
+        while True:
+            try:
+                data = self.reid_result_queue.get(block=True, timeout=0.01)
+                if isinstance(data, DoneSignal):
+                    # Re-ID has finished processing. No more data will be sent to it
+                    self.logger.info("[MCT] Detected done signal from Re-ID. Terminating result query thread.")
+                    break
+
+                self.reid_result = data
+            except queue.Empty:
+                pass
+        self.logger.info("[MCT] Detected done signal from Re-ID. Terminating result query thread.")
 
     def get_latest_data(self):
         feat_data = []  # Features of the online targets. Shape: (num_targets, feat_dim)
@@ -541,6 +536,7 @@ class PipelineMCT(mp.Process):
         image_coords = []  # Image coordinates of the online targets. Shape: (num_targets, 4)
         world_coords = []  # World coordinates of the online targets. Shape: (num_targets, 2)
         frames = []  # Frames of cameras. List of num_cameras cameras
+        frames_idx = []  # Frame indices of cameras. List of num_cameras cameras
         poses = []
         removed_targets = []
 
@@ -552,9 +548,11 @@ class PipelineMCT(mp.Process):
             removed_targets.append(self.cam_latest_data[cam_idx]["removed_targets"])
 
             frame = self.cam_latest_data[cam_idx]["frame"]
+            frame_idx = self.cam_latest_data[cam_idx]["frame_idx"]
             if frame is None:
                 frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
             frames.append(frame)
+            frames_idx.append(frame_idx)
 
             if not terminated:
                 for target in curr_online_targets:
@@ -565,7 +563,41 @@ class PipelineMCT(mp.Process):
                     sct_true_idxs.append(target.track_id)
                     poses.append(target.pose)
 
-        return feat_data, camera_idxs, sct_true_idxs, image_coords, world_coords, poses, frames, removed_targets
+        return feat_data, camera_idxs, sct_true_idxs, image_coords, world_coords, poses, frames, frames_idx, removed_targets
+
+    def init_windows(self):
+        # Initialize windows for visualization
+        window_pos = {
+            "c200_1": (0, 28),
+            "c200_2": (0, 560),
+            "zed2i_1": (960, 28),
+            "zed2i_2": (960, 560),
+        }
+        for cam_name in self.camera_names:
+            cv2.namedWindow(cam_name, cv2.WINDOW_GUI_NORMAL)
+            cv2.moveWindow(cam_name, *window_pos[cam_name])
+            cv2.resizeWindow(cam_name, 960, 460)
+
+    def remove_offline_targets(self,
+                               removed_targets_all_cams: List[Set[int]],
+                               cam_sct_to_global_id: dict,
+                               global_id_to_cam_sct: dict,
+                               global_id_last_seen: dict):
+        ### Remove offline targets ###
+        for cam_idx, removed_targets in enumerate(removed_targets_all_cams):
+            for target_id in removed_targets:
+                global_id = cam_sct_to_global_id.pop((cam_idx, target_id), None)
+
+                # If None, the tracklet has been previously removed
+                if global_id is None:
+                    continue
+
+                if global_id in global_id_to_cam_sct and global_id_to_cam_sct[global_id].get(cam_idx, None) == target_id:
+                    del global_id_to_cam_sct[global_id][cam_idx]
+                    if len(global_id_to_cam_sct[global_id]) == 0:
+                        # Remove the global id if it has no tracklets
+                        global_id_to_cam_sct.pop(global_id)
+                        global_id_last_seen.pop(global_id)
 
     def run(self):
         # Discard SIGTERM and SIGKILL signals
@@ -585,62 +617,29 @@ class PipelineMCT(mp.Process):
         camera_data_getter_threads = [Thread(target=self.single_camera_queue_query, args=(idx,)) for idx in range(len(self.camera_names))]
         for thread in camera_data_getter_threads:
             thread.start()
+        # Start thread to refresh Re-ID result
+        reid_result_thread = Thread(target=self.reid_result_query)
+        reid_result_thread.start()
 
-        # Initialize windows for visualization
-        window_pos = {
-            "c200_1": (0, 28),
-            "c200_2": (0, 560),
-            "zed2i_1": (960, 28),
-            "zed2i_2": (960, 560),
-        }
-        for cam_name in self.camera_names:
-            cv2.namedWindow(cam_name, cv2.WINDOW_GUI_NORMAL)
-            cv2.moveWindow(cam_name, *window_pos[cam_name])
-            cv2.resizeWindow(cam_name, 960, 460)
+        self.init_windows()
 
         # Wait for the start event (all cameras are ready)
         while not self.start_event.is_set():
             self.start_event.wait()
 
         tick_runtime_meter = AverageMeter()
+        tick = 0
         while not all([self.cam_latest_data[cam_idx]["terminated"] for cam_idx in range(len(self.cam_latest_data))]):
             current_time = time.time()
 
-            feat_data, camera_idxs, sct_true_idxs, image_coords, world_coords, poses, frames, removed_targets = self.get_latest_data()
+            feat_data, camera_idxs, sct_true_idxs, image_coords, world_coords, poses, frames, frames_idx, removed_targets_all_cams = self.get_latest_data()
             camera_idxs = np.array(camera_idxs)
             world_coords = np.array(world_coords)
+            sct_true_idxs = np.array(sct_true_idxs)
             poses = np.array(poses)
 
             ### Remove offline targets ###
-            for cam_idx, removed_targets in enumerate(removed_targets):
-                for target_id in removed_targets:
-                    global_id = cam_sct_to_global_id.pop((cam_idx, target_id), None)
-
-                    # If None, the tracklet has been previously removed
-                    if global_id is None:
-                        continue
-
-                    if global_id in global_id_to_cam_sct and global_id_to_cam_sct[global_id].get(cam_idx, None) == target_id:
-                        del global_id_to_cam_sct[global_id][cam_idx]
-                        if len(global_id_to_cam_sct[global_id]) == 0:
-                            # Remove the global id if it has no tracklets
-                            global_id_to_cam_sct.pop(global_id)
-                            global_id_last_seen.pop(global_id)
-
-            # with open(f"/mnt/8tb_ext4/recording_2024_07_01/{tick_runtime_meter.count:06d}.pkl", "wb") as f:
-            #     pickle.dump({
-            #         "feat_data": feat_data,
-            #         "camera_idxs": camera_idxs,
-            #         "sct_true_idxs": sct_true_idxs,
-            #         "image_coords": image_coords,
-            #         "world_coords": world_coords,
-            #         "poses": poses,
-            #         "frames": frames,
-            #         "global_id_to_cam_scts": global_id_to_cam_scts,
-            #         "cam_scts_to_global_id": cam_scts_to_global_id,
-            #         "global_id_counter": global_id_counter,
-            #         "global_id_last_seen": global_id_last_seen,
-            #     }, f, protocol=5)
+            self.remove_offline_targets(removed_targets_all_cams, cam_sct_to_global_id, global_id_to_cam_sct, global_id_last_seen)
 
             if len(feat_data) == 0:  # No online targets
                 time.sleep(0.01)
@@ -652,36 +651,69 @@ class PipelineMCT(mp.Process):
             # Sort the distances by score ascending to get candidate pairs.
             sorted_idx = get_sorted_idx(distances)  # Using default threshold
 
-            in_case_of_crash = {
-                "feat_data": feat_data,
+            global_id_to_cam_sct, cam_sct_to_global_id, global_id_counter, global_id_last_seen = assign_global_ids(
+                sorted_idx, distances, camera_idxs, sct_true_idxs, world_coords,
+                global_id_to_cam_sct, cam_sct_to_global_id, global_id_counter, global_id_last_seen,
+                self.appearance_threshold, self.distance_threshold
+            )
+
+            # in_case_of_crash = {
+            #     "feat_data": feat_data,
+            #     "camera_idxs": camera_idxs,
+            #     "sct_true_idxs": sct_true_idxs,
+            #     "image_coords": image_coords,
+            #     "world_coords": world_coords,
+            #     "poses": poses,
+            #     "frames": frames,
+            #     "sorted_idx": sorted_idx,
+            #     "distances": distances,
+            #     "global_id_to_cam_sct": deepcopy(global_id_to_cam_sct),
+            #     "cam_sct_to_global_id": deepcopy(cam_sct_to_global_id),
+            #     "global_id_counter": deepcopy(global_id_counter),
+            #     "global_id_last_seen": deepcopy(global_id_last_seen),
+            # }
+            # # Assign global IDs to the online tracklets
+            # try:
+            #     global_id_to_cam_sct, cam_sct_to_global_id, global_id_counter, global_id_last_seen = assign_global_ids(
+            #         sorted_idx, distances, camera_idxs, sct_true_idxs, world_coords,
+            #         global_id_to_cam_sct, cam_sct_to_global_id, global_id_counter, global_id_last_seen,
+            #         self.appearance_threshold, self.distance_threshold
+            #     )
+            # except Exception as e:
+            #     print(e)
+
+            #     # Save data
+            #     with open(f"error.pkl", "wb") as f:
+            #         pickle.dump(in_case_of_crash, f, protocol=5)
+            #     raise e
+            ### End of Multi-camera Tracklet Assignment ###
+
+            # Send data to Re-ID
+            re_id_data = {
+                "frame_idxs": [],
+                "global_id_to_cam_sct": global_id_to_cam_sct,
+                "cam_sct_to_global_id": cam_sct_to_global_id,
                 "camera_idxs": camera_idxs,
                 "sct_true_idxs": sct_true_idxs,
-                "image_coords": image_coords,
-                "world_coords": world_coords,
-                "poses": poses,
-                "frames": frames,
-                "sorted_idx": sorted_idx,
-                "distances": distances,
-                "global_id_to_cam_sct": deepcopy(global_id_to_cam_sct),
-                "cam_sct_to_global_id": deepcopy(cam_sct_to_global_id),
-                "global_id_counter": deepcopy(global_id_counter),
-                "global_id_last_seen": deepcopy(global_id_last_seen),
+                "frame_data": [],
+                "pose_data": [],
+                "removed_targets": removed_targets_all_cams,
             }
-            # Assign global IDs to the online tracklets
-            try:
-                global_id_to_cam_sct, cam_sct_to_global_id, global_id_counter, global_id_last_seen = assign_global_ids(
-                    sorted_idx, distances, camera_idxs, sct_true_idxs, world_coords,
-                    global_id_to_cam_sct, cam_sct_to_global_id, global_id_counter, global_id_last_seen,
-                    self.appearance_threshold, self.distance_threshold
-                )
-            except Exception as e:
-                print(e)
 
-                # Save data
-                with open(f"error.pkl", "wb") as f:
-                    pickle.dump(in_case_of_crash, f, protocol=5)
-                raise e
-            ### End of Multi-camera Tracklet Assignment ###
+            for p in range(len(image_coords)):
+                camera_idx = camera_idxs[p]
+                frame = frames[camera_idx]
+                x1, y1, x2, y2 = [int(i) for i in image_coords[p]]
+                x1 = max(0, x1)
+                y1 = max(0, y1)
+                x2 = min(frame.shape[1], x2)
+                y2 = min(frame.shape[0], y2)
+                cropped = frame[y1:y2, x1:x2]
+                re_id_data["frame_data"].append(cropped)
+                re_id_data["frame_idxs"].append(frames_idx[camera_idx])
+                re_id_data["pose_data"].append(poses[p])
+
+            self.reid_queue.put(re_id_data)
 
             # Visualization
             ready_for_visualization = [True for _ in range(len(frames))]
@@ -699,7 +731,9 @@ class PipelineMCT(mp.Process):
                     g_id = cam_sct_to_global_id[(cam, sct_id)]
                     cv2.rectangle(out_frames[cam], (x1, y1), (x1+28, y1+28), (0, 0, 0), -1)
                     cv2.rectangle(out_frames[cam], (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(out_frames[cam], f"{sct_id}/{g_id}", (x1 + 4, y1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+                    name = self.reid_result.get(g_id, "Unknown")
+                    cv2.putText(out_frames[cam], f"{g_id} ({name})", (x1 + 4, y1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
                     # Draw pose
                     pose = poses[p]
@@ -747,11 +781,19 @@ class PipelineMCT(mp.Process):
                     cv2.imwrite(file_path.as_posix(), overlay_map)
 
             tick_runtime_meter.update(time.time() - current_time)
+            tick += 1
 
-        print("[MCT] Received global kill.")
-        print(f"[MCT] Average time per tick: {tick_runtime_meter.avg:.4f} seconds")
-        print(f"[MCT] Average ticks/second: {1 / tick_runtime_meter.avg:.2f} ticks/second")
+        self.logger.info("[MCT] Received global kill.")
+        self.reid_queue.put(DoneSignal())
+
+        self.logger.info(f"[MCT] Average time per tick: {tick_runtime_meter.avg:.4f} seconds")
+        self.logger.info(f"[MCT] Average ticks/second: {1 / tick_runtime_meter.avg:.2f} ticks/second")
 
         for idx, thread in enumerate(camera_data_getter_threads):
-            print(f"[MCT] Joining thread of camera {self.camera_names[idx]}")
+            self.logger.info(f"[MCT] Joining thread of camera {self.camera_names[idx]}")
             thread.join()
+        self.logger.info("[MCT] Joined all camera data getter threads.")
+        reid_result_thread.join()
+
+        self.logger.info("[MCT] Joined Re-ID result thread.")
+        cv2.destroyAllWindows()

@@ -1,4 +1,5 @@
 # Module for various signaling
+import logging
 import multiprocessing as mp
 import signal
 
@@ -8,12 +9,13 @@ class GracefulKiller:
     # Reference: https://stackoverflow.com/a/31464349
     def __init__(self, global_kill_event: mp.Event):
         self.global_kill_event = global_kill_event
+        self.logger = logging.getLogger("GracefulKiller")
         signal.signal(signal.SIGINT, self.exit_gracefully)
         signal.signal(signal.SIGTERM, self.exit_gracefully)
 
     def exit_gracefully(self, signum, frame):
         self.global_kill_event.set()
-        print("SIGINT/SIGTERM received. Terminating all processes.")
+        self.logger.info("SIGINT/SIGTERM received. Terminating all processes.")
 
 
 class DoneSignal:
