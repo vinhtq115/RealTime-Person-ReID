@@ -1,3 +1,4 @@
+import logging
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -10,7 +11,11 @@ import yaml
 
 from modules.pipeline_mct import PipelineMCT
 from modules.pipeline_sct import PipelineSCT
+from modules.pipeline_reid import PipelineReID
 from modules.signaling import GracefulKiller
+
+
+logging.basicConfig(level=logging.DEBUG, format="{asctime} - {levelname} - {message}", datefmt="%Y-%m-%d %H:%M:%S", style="{")
 
 
 if __name__ == "__main__":
@@ -27,6 +32,8 @@ if __name__ == "__main__":
     os.makedirs(raw_data_dir.as_posix(), exist_ok=True)
     screenshot_dir = root_dir / "screenshots"
     os.makedirs(screenshot_dir.as_posix(), exist_ok=True)
+    reid_dump_dir = root_dir / "reid_dump"
+    os.makedirs(reid_dump_dir.as_posix(), exist_ok=True)
 
     # Read config file
     with open(os.environ["CONFIG_FILE"], "r") as file:
@@ -64,16 +71,30 @@ if __name__ == "__main__":
         pipeline.start()
 
     ### Multi Camera Tracking ###
+    reid_queue = mp.Queue()  # For MCT to Re-ID module coomunication
+    reid_result_queue = mp.Queue()  # For Re-ID to MCT module communication
     process_mct = PipelineMCT(
         mct_config=mct_config,
         camera_configs=camera_configs,
         data_queues=data_queues,
+        reid_queue=reid_queue,
+        reid_result_queue=reid_result_queue,
         raw_data_dir=raw_data_dir,
         start_event=start_event,
         global_kill=global_kill,
         screenshot_dir=screenshot_dir,
     )
     process_mct.start()
+
+    ### Re-ID ###
+    process_reid = PipelineReID(
+        model_config=model_configs,
+        save_dir=reid_dump_dir,
+        mct_to_reid_data_queue=reid_queue,
+        reid_to_mct_data_queue=reid_result_queue,
+        global_kill=global_kill,
+    )
+    process_reid.start()
 
     # Wait for all cameras to get ready
     while not all([r.is_set() for r in ready]):
@@ -86,8 +107,12 @@ if __name__ == "__main__":
         time.sleep(0.1)
 
     for idx, process in enumerate(processes_sct):
+        logging.info(f"Terminating camera {idx}")
         process.join()
-
+    logging.info("All cameras terminated.")
     process_mct.join()
+    logging.info("MCT finished.")
+    process_reid.join()
+    logging.info("Re-ID finished.")
 
-    print("All cameras finished.")
+    logging.info("All cameras finished.")

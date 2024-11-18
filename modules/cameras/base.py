@@ -73,6 +73,7 @@ class BaseCamera:
 
     def start_capture(self):
         self.capture_thread.start()
+        self.logger.info(f"[{self.name}] Capture thread started.")
 
     def fast_capture(self):
         """Internal function to continuously grab latest frame."""
@@ -90,7 +91,7 @@ class BaseCamera:
 
             self.latest_frame = frame
             self.hw_frame_idx += 1
-        print("Capture thread terminated.")
+        self.logger.info(f"[{self.name}] Capture thread terminated.")
 
     def capture(self, warmup: bool = False) -> Tuple[np.ndarray, int] | Tuple[None, None]:
         """Read frame from video capture. Also save it if visualization is enabled.
@@ -123,5 +124,9 @@ class BaseCamera:
         self.terminate = True
         if self.ffmpeg:
             self.ffmpeg.close()
+            self.logger.info(f"[{self.name}] Dump file saved.")
 
+        self.capture_thread.join()
+        self.logger.info(f"[{self.name}] Capture thread joined.")
         self.video.release()
+        self.logger.info(f"[{self.name}] Video capture released.")

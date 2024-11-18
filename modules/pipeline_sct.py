@@ -1,5 +1,6 @@
 # Pipeline for single camera tracking (SCT).
 # Includes human detection, pose estimation and single camera tracking.
+import logging
 import multiprocessing as mp
 from pathlib import Path
 import time
@@ -137,6 +138,8 @@ class PipelineSCT(mp.Process):
         self.start_event = start_event
         self.data_queue = data_queue
 
+        self.logger = logging.getLogger("SCT")
+
         self.yolo_config = model_config["yolo"]
         self.bot_sort_config = model_config["bot_sort"]
         self.camera_config = camera_config
@@ -158,6 +161,7 @@ class PipelineSCT(mp.Process):
 
         # Start camera capture
         camera.start_capture()
+        self.logger.info(f"[{name}] Camera started capturing.")
 
         # Initialize YOLO detector
         det_track = YOLOWrapper(**self.yolo_config)
@@ -178,6 +182,8 @@ class PipelineSCT(mp.Process):
         while not self.start_event.is_set():
             self.start_event.wait()
 
+        self.logger.info(f"[{name}] Started.")
+
         # Main loop
         run_times = []
         while not self.global_kill.is_set():
@@ -185,7 +191,7 @@ class PipelineSCT(mp.Process):
             frame, idx = camera.capture()
             if frame is None:
                 if camera.error:
-                    print(f"[{name}] Something is wrong with the camera. Terminating...")
+                    self.logger.error(f"[{name}] Something is wrong with the camera. Terminating...")
                     self.global_kill.set()
                 break
 
@@ -224,11 +230,12 @@ class PipelineSCT(mp.Process):
             run_times.append(time.time() - start_time)
 
             if idx % 900 == 0:
-                print(f"[{name}] Frame {idx}. Tracked/Lost/Removed: {len(self.tracker.tracked_stracks)}/{len(self.tracker.lost_stracks)}/{len(self.tracker.removed_stracks)}")
+                self.logger.info(f"[{name}] Frame {idx}. Tracked/Lost/Removed: {len(self.tracker.tracked_stracks)}/{len(self.tracker.lost_stracks)}/{len(self.tracker.removed_stracks)}")
 
+        self.logger.info(f"[{name}] Releasing...")
         camera.release()
-        print(f"[{name}] Camera shut down.")
-        print(f"[{name}] Average FPS: {1. / np.average(run_times[1:]):.2f}")
+        self.logger.info(f"[{name}] Camera shut down.")
+        self.logger.info(f"[{name}] Average FPS: {1. / np.average(run_times[1:]):.2f}")
 
         # Signal that the camera has finished processing
         self.data_queue.put(DoneSignal())
